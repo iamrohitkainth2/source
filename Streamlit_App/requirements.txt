@@ -1,0 +1,17 @@
+langchain==0.0.284
+python-dotenv==1.0.0
+streamlit==1.22.0
+unstructured==0.9.2
+tiktoken==0.8.0
+faiss-cpu==1.13.2
+libmagic==1.0
+python-magic==0.4.27
+# python-magic-bin==0.4.14
+openai==0.28.0
+beautifulsoup4==4.12.3
+
+# Keep HTTP stack versions aligned to avoid requests runtime warnings.
+requests==2.31.0
+urllib3==1.26.20
+chardet==5.2.0
+charset-normalizer==3.3.2
