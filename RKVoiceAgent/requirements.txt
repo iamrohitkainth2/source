@@ -1,0 +1,11 @@
+livekit-agents>=1.4.4
+livekit-plugins-deepgram>=1.4.4
+livekit-plugins-openai>=1.4.4
+livekit-plugins-elevenlabs>=1.4.4
+livekit-plugins-silero>=1.4.4
+python-dotenv>=1.0.1
+requests>=2.32.3
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+twilio>=9.3.0
+python-multipart>=0.0.12
