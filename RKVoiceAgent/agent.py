@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import time
+from urllib.parse import quote
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -241,9 +242,12 @@ def _log_to_airtable(call_state: CallState) -> None:
 
     pat = _required_env("AIRTABLE_PAT")
     base_id = _required_env("AIRTABLE_BASE_ID")
-    table = os.getenv("AIRTABLE_TABLE", "call_logs")
+    # Prefer table ID (tbl...) when available, since names can be renamed and
+    # may include characters that require URL encoding.
+    table_ref = os.getenv("AIRTABLE_TABLE_ID", "").strip() or os.getenv("AIRTABLE_TABLE", "call_logs")
+    table_ref = quote(table_ref, safe="")
 
-    url = f"https://api.airtable.com/v0/{base_id}/{table}"
+    url = f"https://api.airtable.com/v0/{base_id}/{table_ref}"
     payload = {
         "fields": {
             "caller_number": call_state.caller_number,
@@ -266,8 +270,14 @@ def _log_to_airtable(call_state: CallState) -> None:
         response.raise_for_status()
     except HTTPError as exc:
         body = response.text.strip()
+        hint = ""
+        if response.status_code == 403:
+            hint = (
+                " hint=Verify PAT scopes (data.records:write), base access, and table ref "
+                "(prefer AIRTABLE_TABLE_ID=tbl...)."
+            )
         raise RuntimeError(
-            f"Airtable write failed: status={response.status_code} body={body}"
+            f"Airtable write failed: status={response.status_code} body={body}{hint}"
         ) from exc
 
 
