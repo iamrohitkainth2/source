@@ -5,7 +5,7 @@ import threading
 import time
 from urllib.parse import quote
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from requests import HTTPError
@@ -15,7 +15,7 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import Dial, VoiceResponse
 
 from livekit import rtc
-from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
+from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, tts as lk_tts
 from livekit.agents.voice import Agent, AgentSession, ConversationItemAddedEvent, UserInputTranscribedEvent
 from livekit.plugins import deepgram, elevenlabs, openai, silero
 
@@ -127,6 +127,192 @@ def _resolve_elevenlabs_voice_id(api_key: str) -> str:
     )
 
 
+def _build_tts(elevenlabs_api_key: str) -> elevenlabs.TTS:
+    """Build ElevenLabs TTS with resilient defaults for streaming calls."""
+
+    model = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5").strip() or "eleven_turbo_v2_5"
+    auto_mode = os.getenv("ELEVENLABS_AUTO_MODE", "false").strip().lower() == "true"
+    text_normalization = os.getenv("ELEVENLABS_TEXT_NORMALIZATION", "on").strip().lower()
+    if text_normalization not in {"auto", "off", "on"}:
+        text_normalization = "on"
+
+    return elevenlabs.TTS(
+        api_key=elevenlabs_api_key,
+        voice_id=_resolve_elevenlabs_voice_id(elevenlabs_api_key),
+        model=model,
+        auto_mode=auto_mode,
+        apply_text_normalization=text_normalization,
+    )
+
+
+def _get_tts_fallback_models(primary_model: str) -> List[str]:
+    """Return fallback ElevenLabs models in priority order."""
+
+    raw = os.getenv(
+        "ELEVENLABS_FALLBACK_MODELS",
+        "eleven_turbo_v2_5,eleven_multilingual_v2",
+    )
+    models = [m.strip() for m in raw.split(",") if m.strip()]
+
+    # Preserve order while removing duplicates and skipping current model.
+    deduped: List[str] = []
+    for model in models:
+        if model != primary_model and model not in deduped:
+            deduped.append(model)
+
+    return deduped
+
+
+def _tts_engine_model(tts_engine: lk_tts.TTS) -> str:
+    return str(getattr(tts_engine, "model", "unknown"))
+
+
+async def _tts_probe_has_audio(tts_engine: lk_tts.TTS, text: str) -> bool:
+    """Run a small synthesis probe and confirm at least one audio frame arrives."""
+
+    stream = tts_engine.synthesize(text)
+    try:
+        async with stream:
+            async for ev in stream:
+                if getattr(ev, "frame", None) is not None:
+                    return True
+    except Exception as exc:
+        logger.warning(
+            "TTS probe failed for model=%s error=%s",
+            _tts_engine_model(tts_engine),
+            exc,
+        )
+
+    return False
+
+
+async def _ensure_elevenlabs_tts_ready(tts_engine: elevenlabs.TTS) -> elevenlabs.TTS:
+    """Ensure selected model can synthesize audio; auto-fallback when needed."""
+
+    probe_text = os.getenv("TTS_PROBE_TEXT", "Hello, this is a voice test.").strip()
+    if not probe_text:
+        probe_text = "Hello, this is a voice test."
+
+    current_model = _tts_engine_model(tts_engine)
+    if await _tts_probe_has_audio(tts_engine, probe_text):
+        logger.info("TTS probe succeeded with model=%s", current_model)
+        return tts_engine
+
+    for fallback_model in _get_tts_fallback_models(current_model):
+        try:
+            tts_engine.update_options(model=fallback_model)
+        except Exception:
+            logger.exception("Failed to set ElevenLabs fallback model=%s", fallback_model)
+            continue
+
+        if await _tts_probe_has_audio(tts_engine, probe_text):
+            logger.warning(
+                "Switched ElevenLabs TTS model from %s to fallback %s after empty audio probe",
+                current_model,
+                fallback_model,
+            )
+            return tts_engine
+
+    raise RuntimeError(
+        "ElevenLabs TTS produced no audio frames during startup probe. "
+        "Set ELEVENLABS_MODEL to a supported model and verify account voice/model access."
+    )
+
+
+def _build_openai_tts() -> openai.TTS:
+    """Build fallback OpenAI-compatible TTS (supports Azure OpenAI)."""
+
+    tts_model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip() or "gpt-4o-mini-tts"
+    tts_voice = os.getenv("OPENAI_TTS_VOICE", "ash").strip() or "ash"
+    provider = os.getenv("OPENAI_PROVIDER", "openai").strip().lower()
+
+    if provider == "azure":
+        deployment = (
+            os.getenv("AZURE_OPENAI_TTS_DEPLOYMENT", "").strip()
+            or os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+            or None
+        )
+        tts_endpoint = (
+            os.getenv("AZURE_OPENAI_TTS_ENDPOINT", "").strip()
+            or os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+        )
+        api_version = (
+            os.getenv("AZURE_OPENAI_TTS_API_VERSION", "").strip()
+            or os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
+            or os.getenv("OPENAI_API_VERSION", "").strip()
+            or None
+        )
+        api_key = (
+            os.getenv("AZURE_OPENAI_TTS_API_KEY", "").strip()
+            or os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+            or None
+        )
+        ad_token = os.getenv("AZURE_OPENAI_AD_TOKEN", "").strip() or None
+        if not ad_token:
+            os.environ.pop("AZURE_OPENAI_AD_TOKEN", None)
+
+        kwargs: Dict[str, Any] = {
+            "model": tts_model,
+            "voice": tts_voice,
+            "azure_endpoint": tts_endpoint or _required_env("AZURE_OPENAI_ENDPOINT"),
+            "azure_deployment": deployment,
+            "api_version": api_version,
+        }
+        if api_key:
+            kwargs["api_key"] = api_key
+        if ad_token:
+            kwargs["azure_ad_token"] = ad_token
+
+        return openai.TTS.with_azure(**kwargs)
+
+    return openai.TTS(
+        model=tts_model,
+        voice=tts_voice,
+        api_key=os.getenv("OPENAI_API_KEY", "").strip() or None,
+    )
+
+
+async def _build_resilient_tts(elevenlabs_api_key: str) -> lk_tts.TTS:
+    """Build TTS with a provider fallback to keep calls alive."""
+
+    preferred_provider = os.getenv("TTS_PROVIDER", "openai").strip().lower()
+    allow_provider_fallback = os.getenv("TTS_ENABLE_PROVIDER_FALLBACK", "true").strip().lower() == "true"
+    probe_text = os.getenv("TTS_PROBE_TEXT", "Hello, this is a voice test.").strip() or "Hello, this is a voice test."
+
+    # Primary provider: ElevenLabs.
+    if preferred_provider == "elevenlabs":
+        try:
+            primary = await _ensure_elevenlabs_tts_ready(_build_tts(elevenlabs_api_key))
+            return primary
+        except Exception:
+            logger.exception("Primary ElevenLabs TTS failed startup probe")
+            if not allow_provider_fallback:
+                raise
+
+        fallback = _build_openai_tts()
+        if await _tts_probe_has_audio(fallback, probe_text):
+            logger.warning(
+                "Using fallback TTS provider: OpenAI-compatible (provider=%s model=%s)",
+                fallback.provider,
+                _tts_engine_model(fallback),
+            )
+            return fallback
+
+        raise RuntimeError(
+            "Both ElevenLabs and OpenAI-compatible TTS probes failed. "
+            "Check outbound network access and provider credentials."
+        )
+
+    # Primary provider: OpenAI-compatible TTS.
+    primary = _build_openai_tts()
+    if await _tts_probe_has_audio(primary, probe_text):
+        return primary
+
+    raise RuntimeError(
+        "OpenAI-compatible TTS probe failed. Check TTS model/deployment and credentials."
+    )
+
+
 def _get_call_routing_mode() -> str:
     """Return how Twilio routes inbound calls to LiveKit.
 
@@ -146,18 +332,68 @@ def _get_call_routing_mode() -> str:
 def _validate_startup_configuration(routing_mode: str) -> None:
     """Log non-fatal config warnings to make setup issues obvious."""
 
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if openai_key and not openai_key.startswith("sk-"):
-        logger.warning(
-            "OPENAI_API_KEY does not look like an OpenAI key (expected prefix 'sk-'). "
-            "Check your .env/Coolify variables."
-        )
+    provider = os.getenv("OPENAI_PROVIDER", "openai").strip().lower()
+    if provider == "azure":
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+        if azure_endpoint and not azure_endpoint.startswith("https://"):
+            logger.warning(
+                "AZURE_OPENAI_ENDPOINT should start with https:// (current=%s)",
+                azure_endpoint,
+            )
+    else:
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if openai_key and not openai_key.startswith("sk-"):
+            logger.warning(
+                "OPENAI_API_KEY does not look like an OpenAI key (expected prefix 'sk-'). "
+                "Check your .env/Coolify variables."
+            )
 
     if routing_mode == "sip_trunk":
         logger.info(
             "SIP trunk mode active: Twilio webhook endpoint is not used by this app. "
             "Authorize calls in LiveKit inbound trunk and attach a Credential List or IP ACL on Twilio Termination."
         )
+
+
+def _build_llm() -> openai.LLM:
+    """Build OpenAI-compatible LLM, supporting Azure OpenAI when configured."""
+
+    provider = os.getenv("OPENAI_PROVIDER", "openai").strip().lower()
+    temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.4"))
+
+    if provider == "azure":
+        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+        model = os.getenv("AZURE_OPENAI_MODEL", "").strip() or deployment or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        api_version = (
+            os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
+            or os.getenv("OPENAI_API_VERSION", "").strip()
+            or None
+        )
+        api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip() or None
+        ad_token = os.getenv("AZURE_OPENAI_AD_TOKEN", "").strip() or None
+
+        # Avoid SDK fallback to an empty bearer token when env var exists but is blank.
+        if not ad_token:
+            os.environ.pop("AZURE_OPENAI_AD_TOKEN", None)
+
+        azure_kwargs = {
+            "model": model,
+            "azure_endpoint": _required_env("AZURE_OPENAI_ENDPOINT"),
+            "azure_deployment": deployment or None,
+            "api_version": api_version,
+            "temperature": temperature,
+        }
+        if api_key:
+            azure_kwargs["api_key"] = api_key
+        if ad_token:
+            azure_kwargs["azure_ad_token"] = ad_token
+
+        return openai.LLM.with_azure(**azure_kwargs)
+
+    return openai.LLM(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        temperature=temperature,
+    )
 
 
 def _build_vad() -> silero.VAD:
@@ -247,13 +483,18 @@ def _log_to_airtable(call_state: CallState) -> None:
     table_ref = os.getenv("AIRTABLE_TABLE_ID", "").strip() or os.getenv("AIRTABLE_TABLE", "call_logs")
     table_ref = quote(table_ref, safe="")
 
+    field_caller = os.getenv("AIRTABLE_FIELD_CALLER_NUMBER", "caller_number").strip() or "caller_number"
+    field_duration = os.getenv("AIRTABLE_FIELD_DURATION_SECONDS", "duration_seconds").strip() or "duration_seconds"
+    field_transcript = os.getenv("AIRTABLE_FIELD_TRANSCRIPT", "transcript").strip() or "transcript"
+    field_created = os.getenv("AIRTABLE_FIELD_CREATED_AT", "created_at").strip() or "created_at"
+
     url = f"https://api.airtable.com/v0/{base_id}/{table_ref}"
     payload = {
         "fields": {
-            "caller_number": call_state.caller_number,
-            "duration_seconds": call_state.duration_seconds,
-            "transcript": call_state.transcript,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            field_caller: call_state.caller_number,
+            field_duration: call_state.duration_seconds,
+            field_transcript: call_state.transcript,
+            field_created: datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         }
     }
 
@@ -352,13 +593,9 @@ async def entrypoint(ctx: JobContext) -> None:
     # - ElevenLabs streams synthesized audio chunks while text is still arriving.
     # This minimizes first-response latency for natural conversation.
     stt = deepgram.STT(model=os.getenv("DEEPGRAM_MODEL", "nova-3"))
-    llm = openai.LLM(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=0.4)
+    llm = _build_llm()
     elevenlabs_api_key = _get_elevenlabs_api_key()
-    tts = elevenlabs.TTS(
-        api_key=elevenlabs_api_key,
-        voice_id=_resolve_elevenlabs_voice_id(elevenlabs_api_key),
-        model=os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5"),
-    )
+    tts = await _build_resilient_tts(elevenlabs_api_key)
     vad = _build_vad()
 
     session = AgentSession(
@@ -521,10 +758,26 @@ def _start_webhook_server_in_background() -> None:
 
 if __name__ == "__main__":
     routing_mode = _get_call_routing_mode()
+    llm_provider = os.getenv("OPENAI_PROVIDER", "openai").strip().lower()
 
     # Fail fast for inbound-call routing variables so misconfiguration is visible
     # at startup instead of only when Twilio sends a live call.
-    _required_env("OPENAI_API_KEY")
+    if llm_provider == "azure":
+        _required_env("AZURE_OPENAI_ENDPOINT")
+        if not os.getenv("AZURE_OPENAI_API_KEY", "").strip() and not os.getenv(
+            "AZURE_OPENAI_AD_TOKEN", ""
+        ).strip():
+            raise RuntimeError(
+                "Azure OpenAI requires AZURE_OPENAI_API_KEY or AZURE_OPENAI_AD_TOKEN"
+            )
+        if not os.getenv("AZURE_OPENAI_API_VERSION", "").strip() and not os.getenv(
+            "OPENAI_API_VERSION", ""
+        ).strip():
+            raise RuntimeError(
+                "Azure OpenAI requires AZURE_OPENAI_API_VERSION (or OPENAI_API_VERSION)"
+            )
+    else:
+        _required_env("OPENAI_API_KEY")
     _required_env("DEEPGRAM_API_KEY")
     _required_env("ELEVENLABS_API_KEY")
     _required_env("ELEVENLABS_VOICE_ID")
