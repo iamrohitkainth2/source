@@ -15,8 +15,14 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import Dial, VoiceResponse
 
 from livekit import rtc
-from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, tts as lk_tts
-from livekit.agents.voice import Agent, AgentSession, ConversationItemAddedEvent, UserInputTranscribedEvent
+from livekit.agents import AutoSubscribe, JobContext, JobProcess, WorkerOptions, cli, tts as lk_tts
+from livekit.agents.voice import (
+    Agent,
+    AgentSession,
+    ConversationItemAddedEvent,
+    MetricsCollectedEvent,
+    UserInputTranscribedEvent,
+)
 from livekit.plugins import deepgram, elevenlabs, openai, silero
 
 
@@ -29,6 +35,100 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("rk-voice-agent")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_csv_set(name: str, default_csv: str) -> set[str]:
+    raw = os.getenv(name, default_csv)
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+LATENCY_LOG_ENABLED = _env_bool("LATENCY_LOG_ENABLED", True)
+LATENCY_LOG_TYPES = _env_csv_set("LATENCY_LOG_TYPES", "user_turn,llm,tts,stt")
+
+
+def _ms(value_seconds: Optional[float]) -> Optional[int]:
+    if value_seconds is None:
+        return None
+    return int(round(value_seconds * 1000))
+
+
+def _log_latency_metrics(caller_number: str, event: MetricsCollectedEvent) -> None:
+    """Emit per-turn latency logs from LiveKit's built-in metrics events."""
+
+    if not LATENCY_LOG_ENABLED:
+        return
+
+    metric = event.metrics
+    metric_type = getattr(metric, "type", "unknown")
+    metadata = getattr(metric, "metadata", None)
+    provider = getattr(metadata, "model_provider", None) if metadata else None
+    model = getattr(metadata, "model_name", None) if metadata else None
+
+    if metric_type == "eou_metrics":
+        if "user_turn" not in LATENCY_LOG_TYPES:
+            return
+        logger.info(
+            "Latency user_turn caller_number=%s speech_id=%s end_of_utterance_ms=%s transcription_ms=%s turn_completed_cb_ms=%s",
+            caller_number,
+            getattr(metric, "speech_id", None),
+            _ms(getattr(metric, "end_of_utterance_delay", None)),
+            _ms(getattr(metric, "transcription_delay", None)),
+            _ms(getattr(metric, "on_user_turn_completed_delay", None)),
+        )
+        return
+
+    if metric_type == "llm_metrics":
+        if "llm" not in LATENCY_LOG_TYPES:
+            return
+        logger.info(
+            "Latency llm caller_number=%s speech_id=%s model_provider=%s model_name=%s ttft_ms=%s duration_ms=%s tokens_per_second=%.2f",
+            caller_number,
+            getattr(metric, "speech_id", None),
+            provider,
+            model,
+            _ms(getattr(metric, "ttft", None)),
+            _ms(getattr(metric, "duration", None)),
+            float(getattr(metric, "tokens_per_second", 0.0) or 0.0),
+        )
+        return
+
+    if metric_type == "tts_metrics":
+        if "tts" not in LATENCY_LOG_TYPES:
+            return
+        logger.info(
+            "Latency tts caller_number=%s speech_id=%s segment_id=%s model_provider=%s model_name=%s ttfb_ms=%s duration_ms=%s audio_ms=%s streamed=%s",
+            caller_number,
+            getattr(metric, "speech_id", None),
+            getattr(metric, "segment_id", None),
+            provider,
+            model,
+            _ms(getattr(metric, "ttfb", None)),
+            _ms(getattr(metric, "duration", None)),
+            _ms(getattr(metric, "audio_duration", None)),
+            getattr(metric, "streamed", None),
+        )
+        return
+
+    if metric_type == "stt_metrics":
+        if "stt" not in LATENCY_LOG_TYPES:
+            return
+        logger.info(
+            "Latency stt caller_number=%s model_provider=%s model_name=%s request_ms=%s audio_ms=%s streamed=%s",
+            caller_number,
+            provider,
+            model,
+            _ms(getattr(metric, "duration", None)),
+            _ms(getattr(metric, "audio_duration", None)),
+            getattr(metric, "streamed", None),
+        )
+
 
 
 class CallState:
@@ -273,7 +373,12 @@ def _build_openai_tts() -> openai.TTS:
 
 
 async def _build_resilient_tts(elevenlabs_api_key: str) -> lk_tts.TTS:
-    """Build TTS with a provider fallback to keep calls alive."""
+    """Build TTS with a provider fallback to keep calls alive.
+
+    IMPORTANT: Do not reuse a TTS engine across calls. LiveKit may close the
+    underlying HTTP/WS client session when a call ends, which makes a cached
+    engine fail on the next call with "Session is closed".
+    """
 
     preferred_provider = os.getenv("TTS_PROVIDER", "openai").strip().lower()
     allow_provider_fallback = os.getenv("TTS_ENABLE_PROVIDER_FALLBACK", "true").strip().lower() == "true"
@@ -577,6 +682,23 @@ async def _wait_for_participant_disconnect(
         room.off("connection_state_changed", _on_connection_state_changed)
 
 
+def prewarm(proc: JobProcess) -> None:
+    """Pre-load heavy models once per worker process.
+
+    Called by LiveKit before the first job is dispatched. Storing objects in
+    proc.userdata means entrypoint reuses them instead of rebuilding on every
+    call — saves ~300-600ms of per-call startup time and avoids reloading the
+    Silero VAD model from disk on each call.
+    """
+    from livekit.agents import JobProcess  # noqa: F401 (re-import for type reference)
+
+    proc.userdata["vad"] = _build_vad()
+    proc.userdata["stt"] = deepgram.STT(model=os.getenv("DEEPGRAM_MODEL", "nova-3"))
+    proc.userdata["llm"] = _build_llm()
+    proc.userdata["elevenlabs_api_key"] = _get_elevenlabs_api_key()
+    logger.info("Prewarm complete: VAD/STT/LLM pre-built and ready")
+
+
 async def entrypoint(ctx: JobContext) -> None:
     """LiveKit worker entrypoint for each inbound call."""
 
@@ -587,16 +709,18 @@ async def entrypoint(ctx: JobContext) -> None:
     call_state = CallState(caller_number=caller_number)
     logger.info("Call started. caller_number=%s participant=%s", caller_number, participant.identity)
 
+    # Reuse pre-warmed objects where available (set by prewarm() above).
     # Fully streaming STT -> LLM -> TTS pipeline.
     # - Deepgram streams partial/final transcripts from live audio.
     # - OpenAI streams tokens as they are generated.
     # - ElevenLabs streams synthesized audio chunks while text is still arriving.
     # This minimizes first-response latency for natural conversation.
-    stt = deepgram.STT(model=os.getenv("DEEPGRAM_MODEL", "nova-3"))
-    llm = _build_llm()
-    elevenlabs_api_key = _get_elevenlabs_api_key()
+    userdata = getattr(ctx.proc, "userdata", {}) or {}
+    stt = userdata.get("stt") or deepgram.STT(model=os.getenv("DEEPGRAM_MODEL", "nova-3"))
+    llm = userdata.get("llm") or _build_llm()
+    elevenlabs_api_key = userdata.get("elevenlabs_api_key") or _get_elevenlabs_api_key()
+    vad = userdata.get("vad") or _build_vad()
     tts = await _build_resilient_tts(elevenlabs_api_key)
-    vad = _build_vad()
 
     session = AgentSession(
         vad=vad,
@@ -619,6 +743,10 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_agent_speech(ev: ConversationItemAddedEvent) -> None:
         text = _extract_message_text(ev.item)
         call_state.add_agent_line(text)
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
+        _log_latency_metrics(call_state.caller_number, ev)
 
     agent = Agent(
         instructions=(
@@ -800,6 +928,7 @@ if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
             host=worker_host,
             port=worker_port,
         )

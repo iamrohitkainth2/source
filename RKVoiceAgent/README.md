@@ -81,6 +81,13 @@ Expected Airtable fields in table `call_logs`:
 - `MIN_ENDPOINTING_DELAY`: Lower bound of endpointing delay
 - `MAX_ENDPOINTING_DELAY`: Upper bound of endpointing delay
 
+### Logging
+
+- `LOG_LEVEL`: Base application log level (default `INFO`)
+- `UVICORN_LOG_LEVEL`: Webhook server log level (default `info`)
+- `LATENCY_LOG_ENABLED`: Enable/disable latency logs emitted from LiveKit metrics events (default `true`)
+- `LATENCY_LOG_TYPES`: Comma-separated latency categories to emit (default `user_turn,llm,tts,stt`)
+
 ## Local run
 
 ```bash
