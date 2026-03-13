@@ -835,7 +835,15 @@ async def twilio_voice_webhook(request: Request) -> Response:
 
     # Preserve order while removing duplicates.
     deduped_urls = list(dict.fromkeys(candidate_urls))
+    bypass_signature_validation = _env_bool("TWILIO_DISABLE_SIGNATURE_VALIDATION", False)
     valid = any(validator.validate(url, dict(form), signature) for url in deduped_urls)
+
+    if bypass_signature_validation and not valid:
+        logger.warning(
+            "TWILIO_DISABLE_SIGNATURE_VALIDATION=true: bypassing invalid signature for call_sid=%s",
+            call_sid,
+        )
+        valid = True
 
     if not valid:
         logger.warning(
