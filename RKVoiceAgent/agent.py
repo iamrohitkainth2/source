@@ -52,6 +52,27 @@ def _env_csv_set(name: str, default_csv: str) -> set[str]:
 LATENCY_LOG_ENABLED = _env_bool("LATENCY_LOG_ENABLED", True)
 LATENCY_LOG_TYPES = _env_csv_set("LATENCY_LOG_TYPES", "user_turn,llm,tts,stt")
 
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a professional customer support voice assistant for incoming phone calls. "
+    "Be polite, clear, and empathetic. Keep replies short and conversational. "
+    "Ask one question at a time, confirm key details before taking action, and avoid jargon. "
+    "If the caller asks for human support, collect their request clearly and summarize next steps."
+)
+
+STRICT_FLORA_SCOPE_RULES = (
+    "Critical behavior rules: Only answer as Flora customer support for bouquet, order, "
+    "delivery, and pricing-related queries. Do not provide generic assistant answers outside "
+    "Flora support scope. If asked something unrelated, politely decline and ask a Flora-related "
+    "question. Never invent prices, stock availability, or delivery commitments; when uncertain, "
+    "say you will confirm with the team."
+)
+
+
+def _get_system_prompt() -> str:
+    custom_prompt = os.getenv("SYSTEM_PROMPT", "").strip()
+    base_prompt = custom_prompt or DEFAULT_SYSTEM_PROMPT
+    return f"{base_prompt}\n\n{STRICT_FLORA_SCOPE_RULES}"
+
 
 def _ms(value_seconds: Optional[float]) -> Optional[int]:
     if value_seconds is None:
@@ -166,15 +187,34 @@ def _required_env(name: str) -> str:
 def _get_elevenlabs_api_key() -> str:
     """Resolve ElevenLabs API key across common env var names."""
 
-    key = os.getenv("ELEVEN_API_KEY", "").strip()
-    if not key:
+    # Prefer the canonical variable to avoid stale legacy keys overriding valid config.
+    canonical_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    legacy_key = os.getenv("ELEVEN_API_KEY", "").strip()
+
+    if canonical_key:
+        key = canonical_key
+        if legacy_key and legacy_key != canonical_key:
+            logger.warning(
+                "Both ELEVENLABS_API_KEY and ELEVEN_API_KEY are set with different values. "
+                "Using ELEVENLABS_API_KEY and overriding ELEVEN_API_KEY for compatibility."
+            )
+    elif legacy_key:
+        key = legacy_key
+        logger.warning(
+            "Using legacy ELEVEN_API_KEY because ELEVENLABS_API_KEY is empty. "
+            "Set ELEVENLABS_API_KEY to avoid ambiguity."
+        )
+    else:
         key = _required_env("ELEVENLABS_API_KEY")
-        # Keep plugin compatibility in environments expecting ELEVEN_API_KEY.
-        os.environ["ELEVEN_API_KEY"] = key
+
+    # Keep plugin compatibility in environments expecting ELEVEN_API_KEY.
+    os.environ["ELEVEN_API_KEY"] = key
     return key
 
 
 _cached_elevenlabs_voice_id: Optional[str] = None
+_elevenlabs_unavailable_until: float = 0.0
+_elevenlabs_last_failure_reason: str = ""
 
 
 def _resolve_elevenlabs_voice_id(api_key: str) -> str:
@@ -195,6 +235,19 @@ def _resolve_elevenlabs_voice_id(api_key: str) -> str:
         )
         response.raise_for_status()
         voices = response.json().get("voices", [])
+    except HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code in {401, 403}:
+            raise RuntimeError(
+                "ElevenLabs authentication failed while validating voices. "
+                "Verify ELEVENLABS_API_KEY (and remove stale ELEVEN_API_KEY if present)."
+            ) from exc
+        logger.exception(
+            "Failed to fetch ElevenLabs voices. Using configured voice_id=%s",
+            requested_voice_id,
+        )
+        _cached_elevenlabs_voice_id = requested_voice_id
+        return requested_voice_id
     except Exception:
         logger.exception(
             "Failed to fetch ElevenLabs voices. Using configured voice_id=%s",
@@ -380,19 +433,41 @@ async def _build_resilient_tts(elevenlabs_api_key: str) -> lk_tts.TTS:
     engine fail on the next call with "Session is closed".
     """
 
+    global _elevenlabs_unavailable_until
+    global _elevenlabs_last_failure_reason
+
     preferred_provider = os.getenv("TTS_PROVIDER", "openai").strip().lower()
     allow_provider_fallback = os.getenv("TTS_ENABLE_PROVIDER_FALLBACK", "true").strip().lower() == "true"
+    elevenlabs_retry_cooldown = int(os.getenv("ELEVENLABS_RETRY_COOLDOWN_SECONDS", "300"))
     probe_text = os.getenv("TTS_PROBE_TEXT", "Hello, this is a voice test.").strip() or "Hello, this is a voice test."
 
     # Primary provider: ElevenLabs.
     if preferred_provider == "elevenlabs":
-        try:
-            primary = await _ensure_elevenlabs_tts_ready(_build_tts(elevenlabs_api_key))
-            return primary
-        except Exception:
-            logger.exception("Primary ElevenLabs TTS failed startup probe")
-            if not allow_provider_fallback:
-                raise
+        now = time.time()
+        in_cooldown = now < _elevenlabs_unavailable_until
+        if in_cooldown:
+            remaining = int(max(1, _elevenlabs_unavailable_until - now))
+            logger.warning(
+                "Skipping ElevenLabs probe for %ss due to recent failure: %s",
+                remaining,
+                _elevenlabs_last_failure_reason or "unknown",
+            )
+        else:
+            try:
+                primary = await _ensure_elevenlabs_tts_ready(_build_tts(elevenlabs_api_key))
+                _elevenlabs_unavailable_until = 0.0
+                _elevenlabs_last_failure_reason = ""
+                return primary
+            except Exception as exc:
+                _elevenlabs_last_failure_reason = str(exc) or exc.__class__.__name__
+                _elevenlabs_unavailable_until = time.time() + max(0, elevenlabs_retry_cooldown)
+                logger.warning(
+                    "Primary ElevenLabs TTS failed startup probe; cooling down for %ss. reason=%s",
+                    max(0, elevenlabs_retry_cooldown),
+                    _elevenlabs_last_failure_reason,
+                )
+                if not allow_provider_fallback:
+                    raise
 
         fallback = _build_openai_tts()
         if await _tts_probe_has_audio(fallback, probe_text):
@@ -748,13 +823,7 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
         _log_latency_metrics(call_state.caller_number, ev)
 
-    agent = Agent(
-        instructions=(
-            "You are a concise, helpful phone assistant. "
-            "Keep replies short and conversational. "
-            "If the caller asks for human support, collect their request clearly."
-        )
-    )
+    agent = Agent(instructions=_get_system_prompt())
 
     await session.start(agent=agent, room=ctx.room)
 
