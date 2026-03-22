@@ -68,6 +68,22 @@ llm = AzureChatOpenAI(
 )
 
 if process_url_clicked:
+    error_markers = [
+        " 410 gone",
+        "\n410 gone",
+        "http error 410",
+        " 404 not found",
+        "\n404 not found",
+        "access denied",
+        "forbidden",
+        "captcha",
+        "bot verification",
+    ]
+
+    def is_error_like_document(text):
+        normalized = f" {text.lower().strip()}"
+        return any(marker in normalized for marker in error_markers)
+
     input_urls = [url.strip() for url in urls if url and url.strip()]
     if not input_urls:
         st.error("Please provide at least one valid URL before processing.")
@@ -80,6 +96,20 @@ if process_url_clicked:
 
     # Keep only documents that actually contain readable text.
     data = [doc for doc in data if getattr(doc, "page_content", "").strip()]
+
+    # Remove obvious HTTP-error or bot-block pages from loaded content.
+    removed_sources = []
+    filtered_data = []
+    for doc in data:
+        page_text = getattr(doc, "page_content", "")
+        if is_error_like_document(page_text):
+            source = "Unknown source"
+            if getattr(doc, "metadata", None):
+                source = doc.metadata.get("source", "Unknown source")
+            removed_sources.append(source)
+        else:
+            filtered_data.append(doc)
+    data = filtered_data
 
     # Fallback loader for pages that fail Unstructured parsing in Azure.
     if not data:
@@ -102,6 +132,13 @@ if process_url_clicked:
         )
         st.stop()
 
+    if removed_sources:
+        unique_sources = list(dict.fromkeys(removed_sources))
+        st.warning(
+            "Skipped potential error pages: "
+            + ", ".join(unique_sources)
+        )
+
     # split data
     text_splitter = RecursiveCharacterTextSplitter(
         separators=['\n\n', '\n', '.', ','],
@@ -113,6 +150,21 @@ if process_url_clicked:
     if not docs:
         st.error("No text chunks were produced from the fetched URLs.")
         st.stop()
+
+    st.subheader("Loaded Chunks")
+    st.write(f"Total chunks: {len(docs)}")
+    with st.expander("View chunk previews", expanded=True):
+        for idx, doc in enumerate(docs, start=1):
+            source = "Unknown source"
+            if getattr(doc, "metadata", None):
+                source = doc.metadata.get("source", "Unknown source")
+
+            preview = doc.page_content[:400].replace("\n", " ").strip()
+            if len(doc.page_content) > 400:
+                preview += "..."
+
+            st.markdown(f"**Chunk {idx}** - `{source}`")
+            st.write(preview)
 
     # create embeddings and save it to FAISS index
     # embeddings = OpenAIEmbeddings()
@@ -166,7 +218,19 @@ if query:
                 )
             except TypeError:
                 vectorstore = FAISS.load_local(file_path, embeddings)
-            chain = RetrievalQAWithSourcesChain.from_llm(llm=llm, retriever=vectorstore.as_retriever())
+            # Avoid old LangChain map_reduce token-usage merge bug with Azure/OpenAI responses.
+            try:
+                chain = RetrievalQAWithSourcesChain.from_chain_type(
+                    llm=llm,
+                    chain_type="stuff",
+                    retriever=vectorstore.as_retriever(),
+                )
+            except Exception:
+                # Fallback for older variants that may not expose from_chain_type.
+                chain = RetrievalQAWithSourcesChain.from_llm(
+                    llm=llm,
+                    retriever=vectorstore.as_retriever(),
+                )
             result = chain({"question": query}, return_only_outputs=True)
             # result will be a dictionary of this format --> {"answer": "", "sources": [] }
             st.header("Answer")
