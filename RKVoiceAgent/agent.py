@@ -15,7 +15,19 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import Dial, VoiceResponse
 
 from livekit import rtc
-from livekit.agents import AutoSubscribe, JobContext, JobProcess, WorkerOptions, cli, tts as lk_tts
+from livekit.agents import (
+    APIConnectionError,
+    APIConnectOptions,
+    APIStatusError,
+    APITimeoutError,
+    AutoSubscribe,
+    DEFAULT_API_CONNECT_OPTIONS,
+    JobContext,
+    JobProcess,
+    WorkerOptions,
+    cli,
+    tts as lk_tts,
+)
 from livekit.agents.voice import (
     Agent,
     AgentSession,
@@ -24,6 +36,11 @@ from livekit.agents.voice import (
     UserInputTranscribedEvent,
 )
 from livekit.plugins import deepgram, elevenlabs, openai, silero
+
+try:
+    import azure.cognitiveservices.speech as speechsdk  # pyright: ignore[reportMissingImports]
+except Exception:
+    speechsdk = None
 
 
 # Load local environment variables for development.
@@ -215,6 +232,13 @@ def _get_elevenlabs_api_key() -> str:
 _cached_elevenlabs_voice_id: Optional[str] = None
 _elevenlabs_unavailable_until: float = 0.0
 _elevenlabs_last_failure_reason: str = ""
+
+
+def _tts_provider() -> str:
+    provider = os.getenv("TTS_PROVIDER", "openai").strip().lower()
+    if provider not in {"openai", "elevenlabs", "azure_speech"}:
+        raise RuntimeError("Invalid TTS_PROVIDER. Use 'openai', 'elevenlabs', or 'azure_speech'.")
+    return provider
 
 
 def _resolve_elevenlabs_voice_id(api_key: str) -> str:
@@ -425,7 +449,109 @@ def _build_openai_tts() -> openai.TTS:
     )
 
 
-async def _build_resilient_tts(elevenlabs_api_key: str) -> lk_tts.TTS:
+def _azure_speech_output_format() -> tuple[str, int, int, Any]:
+    if speechsdk is None:
+        raise RuntimeError(
+            "Azure Speech SDK is not installed. Add azure-cognitiveservices-speech to requirements.txt"
+        )
+
+    output = os.getenv("AZURE_SPEECH_OUTPUT_FORMAT", "raw16khz16bitmonopcm").strip().lower()
+    format_map = {
+        "raw16khz16bitmonopcm": (16000, 1, speechsdk.SpeechSynthesisOutputFormat.Raw16Khz16BitMonoPcm),
+        "raw24khz16bitmonopcm": (24000, 1, speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm),
+        "raw48khz16bitmonopcm": (48000, 1, speechsdk.SpeechSynthesisOutputFormat.Raw48Khz16BitMonoPcm),
+    }
+    return (output, *format_map.get(output, format_map["raw16khz16bitmonopcm"]))
+
+
+class _AzureSpeechChunkedStream(lk_tts.ChunkedStream):
+    def __init__(self, *, tts: "AzureSpeechTTS", input_text: str, conn_options: APIConnectOptions) -> None:
+        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
+        self._tts: AzureSpeechTTS = tts
+
+    async def _run(self, output_emitter: lk_tts.AudioEmitter) -> None:
+        try:
+            request_id, audio_data = await asyncio.wait_for(
+                asyncio.to_thread(self._tts._synthesize_blocking, self.input_text),
+                timeout=max(1.0, float(self._conn_options.timeout)) + 5.0,
+            )
+            output_emitter.initialize(
+                request_id=request_id,
+                sample_rate=self._tts.sample_rate,
+                num_channels=self._tts.num_channels,
+                mime_type="audio/pcm",
+            )
+            output_emitter.push(audio_data)
+            output_emitter.flush()
+        except APITimeoutError:
+            raise
+        except APIStatusError:
+            raise
+        except asyncio.TimeoutError:
+            raise APITimeoutError("Azure Speech synthesis timed out.") from None
+        except Exception as exc:
+            raise APIConnectionError(str(exc) or "Azure Speech synthesis failed.") from exc
+
+
+class AzureSpeechTTS(lk_tts.TTS):
+    def __init__(self) -> None:
+        output_name, sample_rate, num_channels, speech_format = _azure_speech_output_format()
+        super().__init__(
+            capabilities=lk_tts.TTSCapabilities(streaming=False),
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+        )
+        self._key = _required_env("AZURE_SPEECH_KEY")
+        self._region = _required_env("AZURE_SPEECH_REGION")
+        self._voice = os.getenv("AZURE_SPEECH_VOICE", "en-US-AriaNeural").strip() or "en-US-AriaNeural"
+        self._speech_format = speech_format
+        self._output_name = output_name
+
+    @property
+    def model(self) -> str:
+        return f"{self._voice}/{self._output_name}"
+
+    @property
+    def provider(self) -> str:
+        return f"azure_speech:{self._region}"
+
+    def synthesize(
+        self,
+        text: str,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> _AzureSpeechChunkedStream:
+        return _AzureSpeechChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+
+    def _synthesize_blocking(self, text: str) -> tuple[str, bytes]:
+        if speechsdk is None:
+            raise RuntimeError("Azure Speech SDK unavailable")
+
+        speech_config = speechsdk.SpeechConfig(subscription=self._key, region=self._region)
+        speech_config.speech_synthesis_voice_name = self._voice
+        speech_config.set_speech_synthesis_output_format(self._speech_format)
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+
+        result = synthesizer.speak_text_async(text).get()
+        request_id = str(getattr(result, "result_id", "") or "")
+        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            audio_data = bytes(getattr(result, "audio_data", b""))
+            if not audio_data:
+                raise APIConnectionError("Azure Speech returned empty audio data.")
+            return request_id, audio_data
+
+        if result.reason == speechsdk.ResultReason.Canceled:
+            details = speechsdk.SpeechSynthesisCancellationDetails.from_result(result)
+            error_details = (getattr(details, "error_details", "") or "Azure Speech synthesis canceled").strip()
+            lowered = error_details.lower()
+            if "401" in lowered or "403" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
+                raise APIStatusError(error_details, status_code=401, request_id=request_id)
+            raise APIConnectionError(error_details)
+
+        raise APIConnectionError(f"Azure Speech returned unexpected result reason: {result.reason}")
+
+
+async def _build_resilient_tts(elevenlabs_api_key: Optional[str] = None) -> lk_tts.TTS:
     """Build TTS with a provider fallback to keep calls alive.
 
     IMPORTANT: Do not reuse a TTS engine across calls. LiveKit may close the
@@ -436,13 +562,36 @@ async def _build_resilient_tts(elevenlabs_api_key: str) -> lk_tts.TTS:
     global _elevenlabs_unavailable_until
     global _elevenlabs_last_failure_reason
 
-    preferred_provider = os.getenv("TTS_PROVIDER", "openai").strip().lower()
+    preferred_provider = _tts_provider()
     allow_provider_fallback = os.getenv("TTS_ENABLE_PROVIDER_FALLBACK", "true").strip().lower() == "true"
     elevenlabs_retry_cooldown = int(os.getenv("ELEVENLABS_RETRY_COOLDOWN_SECONDS", "300"))
     probe_text = os.getenv("TTS_PROBE_TEXT", "Hello, this is a voice test.").strip() or "Hello, this is a voice test."
 
+    if preferred_provider == "azure_speech":
+        primary = AzureSpeechTTS()
+        if await _tts_probe_has_audio(primary, probe_text):
+            return primary
+        if not allow_provider_fallback:
+            raise RuntimeError("Azure Speech TTS probe failed and provider fallback is disabled.")
+
+        fallback = _build_openai_tts()
+        if await _tts_probe_has_audio(fallback, probe_text):
+            logger.warning(
+                "Using fallback TTS provider: OpenAI-compatible (provider=%s model=%s)",
+                fallback.provider,
+                _tts_engine_model(fallback),
+            )
+            return fallback
+
+        raise RuntimeError(
+            "Both Azure Speech and OpenAI-compatible TTS probes failed. "
+            "Check provider credentials and network connectivity."
+        )
+
     # Primary provider: ElevenLabs.
     if preferred_provider == "elevenlabs":
+        if not elevenlabs_api_key:
+            elevenlabs_api_key = _get_elevenlabs_api_key()
         now = time.time()
         in_cooldown = now < _elevenlabs_unavailable_until
         if in_cooldown:
@@ -770,7 +919,10 @@ def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = _build_vad()
     proc.userdata["stt"] = deepgram.STT(model=os.getenv("DEEPGRAM_MODEL", "nova-3"))
     proc.userdata["llm"] = _build_llm()
-    proc.userdata["elevenlabs_api_key"] = _get_elevenlabs_api_key()
+    if _tts_provider() == "elevenlabs":
+        proc.userdata["elevenlabs_api_key"] = _get_elevenlabs_api_key()
+    else:
+        proc.userdata["elevenlabs_api_key"] = None
     logger.info("Prewarm complete: VAD/STT/LLM pre-built and ready")
 
 
@@ -793,7 +945,7 @@ async def entrypoint(ctx: JobContext) -> None:
     userdata = getattr(ctx.proc, "userdata", {}) or {}
     stt = userdata.get("stt") or deepgram.STT(model=os.getenv("DEEPGRAM_MODEL", "nova-3"))
     llm = userdata.get("llm") or _build_llm()
-    elevenlabs_api_key = userdata.get("elevenlabs_api_key") or _get_elevenlabs_api_key()
+    elevenlabs_api_key = userdata.get("elevenlabs_api_key")
     vad = userdata.get("vad") or _build_vad()
     tts = await _build_resilient_tts(elevenlabs_api_key)
 
@@ -964,6 +1116,7 @@ def _start_webhook_server_in_background() -> None:
 if __name__ == "__main__":
     routing_mode = _get_call_routing_mode()
     llm_provider = os.getenv("OPENAI_PROVIDER", "openai").strip().lower()
+    tts_provider = _tts_provider()
 
     # Fail fast for inbound-call routing variables so misconfiguration is visible
     # at startup instead of only when Twilio sends a live call.
@@ -984,8 +1137,12 @@ if __name__ == "__main__":
     else:
         _required_env("OPENAI_API_KEY")
     _required_env("DEEPGRAM_API_KEY")
-    _required_env("ELEVENLABS_API_KEY")
-    _required_env("ELEVENLABS_VOICE_ID")
+    if tts_provider == "elevenlabs":
+        _required_env("ELEVENLABS_API_KEY")
+        _required_env("ELEVENLABS_VOICE_ID")
+    elif tts_provider == "azure_speech":
+        _required_env("AZURE_SPEECH_KEY")
+        _required_env("AZURE_SPEECH_REGION")
     if routing_mode == "webhook":
         _required_env("TWILIO_AUTH_TOKEN")
         _required_env("LIVEKIT_SIP_URI")

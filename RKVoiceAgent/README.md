@@ -1,6 +1,6 @@
 # RK Voice Agent (LiveKit + Twilio SIP)
 
-Self-hosted inbound phone voice agent using LiveKit Agents (Python), Deepgram (STT), OpenAI (LLM), ElevenLabs (TTS), Silero (VAD), Twilio SIP, and Airtable logging.
+Self-hosted inbound phone voice agent using LiveKit Agents (Python), Deepgram (STT), OpenAI (LLM), ElevenLabs or Azure Speech (TTS), Silero (VAD), Twilio SIP, and Airtable logging.
 
 ## What this project does
 
@@ -48,6 +48,13 @@ In production (Coolify), set the same keys in the Coolify environment UI.
 - `ELEVENLABS_VOICE_ID`: Voice ID for speech output
 - `ELEVENLABS_MODEL`: TTS model (default `eleven_flash_v2_5`)
 
+### Azure Speech (optional TTS provider)
+
+- `AZURE_SPEECH_KEY`: Azure Speech resource key
+- `AZURE_SPEECH_REGION`: Azure Speech region (for example `eastus`)
+- `AZURE_SPEECH_VOICE`: Voice name (default `en-US-AriaNeural`)
+- `AZURE_SPEECH_OUTPUT_FORMAT`: Raw PCM output format used by LiveKit (`raw16khz16bitmonopcm`, `raw24khz16bitmonopcm`, `raw48khz16bitmonopcm`)
+
 ### Airtable
 
 - `AIRTABLE_PAT`: Airtable personal access token
@@ -87,6 +94,12 @@ Expected Airtable fields in table `call_logs`:
 - `UVICORN_LOG_LEVEL`: Webhook server log level (default `info`)
 - `LATENCY_LOG_ENABLED`: Enable/disable latency logs emitted from LiveKit metrics events (default `true`)
 - `LATENCY_LOG_TYPES`: Comma-separated latency categories to emit (default `user_turn,llm,tts,stt`)
+
+### TTS routing
+
+- `TTS_PROVIDER`: `openai`, `elevenlabs`, or `azure_speech`
+- `TTS_ENABLE_PROVIDER_FALLBACK`: When `true`, fallback to OpenAI-compatible TTS if primary probe fails
+- `ELEVENLABS_RETRY_COOLDOWN_SECONDS`: Cooldown before retrying ElevenLabs after a failed probe
 
 ## Local run
 

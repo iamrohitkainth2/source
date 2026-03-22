@@ -3,6 +3,7 @@ livekit-plugins-deepgram>=1.4.4
 livekit-plugins-openai>=1.4.4
 livekit-plugins-elevenlabs>=1.4.4
 livekit-plugins-silero>=1.4.4
+azure-cognitiveservices-speech>=1.41.1
 python-dotenv>=1.0.1
 requests>=2.32.3
 fastapi>=0.115.0
